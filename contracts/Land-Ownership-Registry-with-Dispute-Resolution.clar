@@ -256,3 +256,248 @@
   (var-get dispute-id-counter)
 )
 
+(define-constant ERR_AUCTION_NOT_FOUND (err u109))
+(define-constant ERR_AUCTION_ENDED (err u110))
+(define-constant ERR_BID_TOO_LOW (err u111))
+(define-constant ERR_AUCTION_ACTIVE (err u112))
+
+(define-data-var auction-id-counter uint u0)
+
+(define-map land-auctions
+  uint
+  {
+    land-id: uint,
+    seller: principal,
+    starting-price: uint,
+    current-bid: uint,
+    highest-bidder: (optional principal),
+    end-block: uint,
+    is-active: bool
+  }
+)
+
+(define-map auction-bids
+  {auction-id: uint, bidder: principal}
+  uint
+)
+
+(define-public (create-auction (land-id uint) (starting-price uint) (duration uint))
+  (let ((new-auction-id (+ (var-get auction-id-counter) u1)))
+    (match (map-get? land-registry land-id)
+      land-data
+      (begin
+        (asserts! (is-eq tx-sender (get owner land-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-verified land-data) ERR_NOT_AUTHORIZED)
+        (map-set land-auctions new-auction-id
+          {
+            land-id: land-id,
+            seller: tx-sender,
+            starting-price: starting-price,
+            current-bid: starting-price,
+            highest-bidder: none,
+            end-block: (+ stacks-block-height duration),
+            is-active: true
+          }
+        )
+        (var-set auction-id-counter new-auction-id)
+        (ok new-auction-id)
+      )
+      ERR_LAND_NOT_FOUND
+    )
+  )
+)
+
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+  (match (map-get? land-auctions auction-id)
+    auction-data
+    (begin
+      (asserts! (get is-active auction-data) ERR_AUCTION_ENDED)
+      (asserts! (< stacks-block-height (get end-block auction-data)) ERR_AUCTION_ENDED)
+      (asserts! (> bid-amount (get current-bid auction-data)) ERR_BID_TOO_LOW)
+      (asserts! (>= (stx-get-balance tx-sender) bid-amount) ERR_INSUFFICIENT_STAKE)
+      
+      (match (get highest-bidder auction-data)
+        previous-bidder
+        (let ((previous-bid (get current-bid auction-data)))
+          (try! (as-contract (stx-transfer? previous-bid tx-sender previous-bidder)))
+        )
+        true
+      )
+      
+      (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+      
+      (map-set land-auctions auction-id
+        (merge auction-data
+          {
+            current-bid: bid-amount,
+            highest-bidder: (some tx-sender)
+          }
+        )
+      )
+      (map-set auction-bids {auction-id: auction-id, bidder: tx-sender} bid-amount)
+      (ok true)
+    )
+    ERR_AUCTION_NOT_FOUND
+  )
+)
+
+(define-public (finalize-auction (auction-id uint))
+  (match (map-get? land-auctions auction-id)
+    auction-data
+    (begin
+      (asserts! (get is-active auction-data) ERR_AUCTION_ENDED)
+      (asserts! (>= stacks-block-height (get end-block auction-data)) ERR_AUCTION_ACTIVE)
+      
+      (match (get highest-bidder auction-data)
+        winner
+        (match (map-get? land-registry (get land-id auction-data))
+          land-data
+          (begin
+            (try! (as-contract (stx-transfer? (get current-bid auction-data) tx-sender (get seller auction-data))))
+            (map-set land-registry (get land-id auction-data) (merge land-data {owner: winner}))
+            (map-set land-auctions auction-id (merge auction-data {is-active: false}))
+            (ok true)
+          )
+          ERR_LAND_NOT_FOUND
+        )
+        (begin
+          (map-set land-auctions auction-id (merge auction-data {is-active: false}))
+          (ok false)
+        )
+      )
+    )
+    ERR_AUCTION_NOT_FOUND
+  )
+)
+
+(define-read-only (get-auction-info (auction-id uint))
+  (map-get? land-auctions auction-id)
+)
+
+(define-read-only (get-auction-count)
+  (var-get auction-id-counter)
+)
+
+(define-data-var history-id-counter uint u0)
+
+(define-map land-history
+  uint
+  {
+    land-id: uint,
+    event-type: (string-ascii 20),
+    from-owner: (optional principal),
+    to-owner: (optional principal),
+    timestamp: uint,
+    block-height: uint,
+    additional-data: (string-ascii 200)
+  }
+)
+
+(define-map land-history-index
+  uint
+  (list 50 uint)
+)
+
+(define-private (add-history-entry (land-id uint) (event-type (string-ascii 20)) (from-owner (optional principal)) (to-owner (optional principal)) (additional-data (string-ascii 200)))
+  (let ((new-history-id (+ (var-get history-id-counter) u1))
+        (current-history (default-to (list) (map-get? land-history-index land-id))))
+    (map-set land-history new-history-id
+      {
+        land-id: land-id,
+        event-type: event-type,
+        from-owner: from-owner,
+        to-owner: to-owner,
+        timestamp: stacks-block-height,
+        block-height: stacks-block-height,
+        additional-data: additional-data
+      }
+    )
+    (map-set land-history-index land-id (unwrap-panic (as-max-len? (append current-history new-history-id) u50)))
+    (var-set history-id-counter new-history-id)
+    new-history-id
+  )
+)
+
+(define-public (register-land-with-history (size uint) (gps-coordinates (string-ascii 100)) (document-hash (string-ascii 64)))
+  (let ((new-land-id (+ (var-get land-id-counter) u1)))
+    (map-set land-registry new-land-id
+      {
+        owner: tx-sender,
+        size: size,
+        gps-coordinates: gps-coordinates,
+        document-hash: document-hash,
+        is-verified: false,
+        created-at: stacks-block-height
+      }
+    )
+    (var-set land-id-counter new-land-id)
+    (add-history-entry new-land-id "registration" none (some tx-sender) "Initial land registration")
+    (ok new-land-id)
+  )
+)
+
+(define-public (complete-transfer-with-history (land-id uint))
+  (match (map-get? land-transfers land-id)
+    transfer-data
+    (match (map-get? land-registry land-id)
+      land-data
+      (begin
+        (asserts! (is-eq tx-sender (get notary transfer-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get is-completed transfer-data)) ERR_INVALID_TRANSFER)
+        (map-set land-registry land-id (merge land-data {owner: (get to transfer-data)}))
+        (map-set land-transfers land-id (merge transfer-data {is-completed: true}))
+        (add-history-entry land-id "transfer" (some (get from transfer-data)) (some (get to transfer-data)) "Notarized transfer completed")
+        (ok true)
+      )
+      ERR_LAND_NOT_FOUND
+    )
+    ERR_INVALID_TRANSFER
+  )
+)
+
+(define-public (verify-land-with-history (land-id uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (match (map-get? land-registry land-id)
+      land-data
+      (begin
+        (map-set land-registry land-id (merge land-data {is-verified: true}))
+        (add-history-entry land-id "verification" none (some (get owner land-data)) "Land ownership verified by authority")
+        (ok true)
+      )
+      ERR_LAND_NOT_FOUND
+    )
+  )
+)
+
+(define-public (add-land-annotation (land-id uint) (annotation (string-ascii 200)))
+  (match (map-get? land-registry land-id)
+    land-data
+    (begin
+      (asserts! (is-eq tx-sender (get owner land-data)) ERR_NOT_AUTHORIZED)
+      (add-history-entry land-id "annotation" (some tx-sender) (some tx-sender) annotation)
+      (ok true)
+    )
+    ERR_LAND_NOT_FOUND
+  )
+)
+
+(define-read-only (get-land-history (land-id uint))
+  (map-get? land-history-index land-id)
+)
+
+(define-read-only (get-history-entry (history-id uint))
+  (map-get? land-history history-id)
+)
+
+(define-read-only (get-land-ownership-chain (land-id uint))
+  (match (map-get? land-history-index land-id)
+    history-ids
+    (some (map get-history-entry history-ids))
+    none
+  )
+)
+
+(define-read-only (get-history-count)
+  (var-get history-id-counter)
+)
