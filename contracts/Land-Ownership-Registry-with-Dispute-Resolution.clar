@@ -501,3 +501,140 @@
 (define-read-only (get-history-count)
   (var-get history-id-counter)
 )
+
+(define-constant ERR_RENTAL_NOT_FOUND (err u113))
+(define-constant ERR_RENTAL_EXPIRED (err u114))
+(define-constant ERR_PAYMENT_OVERDUE (err u115))
+(define-constant ERR_RENTAL_ACTIVE (err u116))
+
+(define-data-var rental-id-counter uint u0)
+
+(define-map land-rentals
+  uint
+  {
+    land-id: uint,
+    landlord: principal,
+    tenant: principal,
+    monthly-rent: uint,
+    deposit: uint,
+    start-block: uint,
+    end-block: uint,
+    last-payment-block: uint,
+    is-active: bool
+  }
+)
+
+(define-map rental-payments
+  {rental-id: uint, payment-id: uint}
+  {
+    amount: uint,
+    timestamp: uint,
+    block-height: uint
+  }
+)
+
+(define-public (create-rental (land-id uint) (tenant principal) (monthly-rent uint) (deposit uint) (duration-blocks uint))
+  (let ((new-rental-id (+ (var-get rental-id-counter) u1)))
+    (match (map-get? land-registry land-id)
+      land-data
+      (begin
+        (asserts! (is-eq tx-sender (get owner land-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-verified land-data) ERR_NOT_AUTHORIZED)
+        (map-set land-rentals new-rental-id
+          {
+            land-id: land-id,
+            landlord: tx-sender,
+            tenant: tenant,
+            monthly-rent: monthly-rent,
+            deposit: deposit,
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height duration-blocks),
+            last-payment-block: stacks-block-height,
+            is-active: true
+          }
+        )
+        (var-set rental-id-counter new-rental-id)
+        (ok new-rental-id)
+      )
+      ERR_LAND_NOT_FOUND
+    )
+  )
+)
+
+(define-public (pay-rent (rental-id uint))
+  (match (map-get? land-rentals rental-id)
+    rental-data
+    (begin
+      (asserts! (is-eq tx-sender (get tenant rental-data)) ERR_NOT_AUTHORIZED)
+      (asserts! (get is-active rental-data) ERR_RENTAL_EXPIRED)
+      (asserts! (< stacks-block-height (get end-block rental-data)) ERR_RENTAL_EXPIRED)
+      (asserts! (>= (stx-get-balance tx-sender) (get monthly-rent rental-data)) ERR_INSUFFICIENT_STAKE)
+      
+      (try! (stx-transfer? (get monthly-rent rental-data) tx-sender (get landlord rental-data)))
+      
+      (map-set land-rentals rental-id
+        (merge rental-data {last-payment-block: stacks-block-height})
+      )
+      
+      (map-set rental-payments {rental-id: rental-id, payment-id: stacks-block-height} 
+        {
+          amount: (get monthly-rent rental-data),
+          timestamp: stacks-block-height,
+          block-height: stacks-block-height
+        }
+      )
+      (ok true)
+    )
+    ERR_RENTAL_NOT_FOUND
+  )
+)
+
+(define-public (pay-deposit (rental-id uint))
+  (match (map-get? land-rentals rental-id)
+    rental-data
+    (begin
+      (asserts! (is-eq tx-sender (get tenant rental-data)) ERR_NOT_AUTHORIZED)
+      (asserts! (get is-active rental-data) ERR_RENTAL_EXPIRED)
+      (asserts! (>= (stx-get-balance tx-sender) (get deposit rental-data)) ERR_INSUFFICIENT_STAKE)
+      
+      (try! (stx-transfer? (get deposit rental-data) tx-sender (get landlord rental-data)))
+      (ok true)
+    )
+    ERR_RENTAL_NOT_FOUND
+  )
+)
+
+(define-public (terminate-rental (rental-id uint))
+  (match (map-get? land-rentals rental-id)
+    rental-data
+    (begin
+      (asserts! (or (is-eq tx-sender (get landlord rental-data)) (is-eq tx-sender (get tenant rental-data))) ERR_NOT_AUTHORIZED)
+      (map-set land-rentals rental-id (merge rental-data {is-active: false}))
+      (ok true)
+    )
+    ERR_RENTAL_NOT_FOUND
+  )
+)
+
+(define-read-only (get-rental-info (rental-id uint))
+  (map-get? land-rentals rental-id)
+)
+
+(define-read-only (get-rental-payment (rental-id uint) (payment-id uint))
+  (map-get? rental-payments {rental-id: rental-id, payment-id: payment-id})
+)
+
+(define-read-only (is-rent-overdue (rental-id uint) (blocks-per-month uint))
+  (match (map-get? land-rentals rental-id)
+    rental-data
+    (if (get is-active rental-data)
+      (> (- stacks-block-height (get last-payment-block rental-data)) blocks-per-month)
+      false
+    )
+    false
+  )
+)
+
+(define-read-only (get-rental-count)
+  (var-get rental-id-counter)
+)
