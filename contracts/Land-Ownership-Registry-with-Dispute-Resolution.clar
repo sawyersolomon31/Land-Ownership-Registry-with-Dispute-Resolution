@@ -638,3 +638,244 @@
 (define-read-only (get-rental-count)
   (var-get rental-id-counter)
 )
+
+(define-constant ERR_POLICY_NOT_FOUND (err u117))
+(define-constant ERR_POLICY_EXPIRED (err u118))
+(define-constant ERR_CLAIM_NOT_FOUND (err u119))
+(define-constant ERR_CLAIM_ALREADY_PROCESSED (err u120))
+(define-constant ERR_INSUFFICIENT_COVERAGE (err u121))
+(define-constant ERR_PREMIUM_OVERDUE (err u122))
+
+(define-data-var policy-id-counter uint u0)
+(define-data-var claim-id-counter uint u0)
+(define-data-var insurance-pool uint u0)
+
+(define-map insurance-policies
+  uint
+  {
+    land-id: uint,
+    policyholder: principal,
+    coverage-amount: uint,
+    annual-premium: uint,
+    start-block: uint,
+    end-block: uint,
+    last-premium-payment: uint,
+    is-active: bool
+  }
+)
+
+(define-map insurance-claims
+  uint
+  {
+    policy-id: uint,
+    claimant: principal,
+    damage-description: (string-ascii 500),
+    claim-amount: uint,
+    assessor: (optional principal),
+    status: (string-ascii 20),
+    filed-at: uint,
+    processed-at: (optional uint)
+  }
+)
+
+(define-map insurance-assessors
+  principal
+  {
+    reputation-score: uint,
+    total-claims-assessed: uint,
+    is-active: bool
+  }
+)
+
+(define-public (register-assessor)
+  (begin
+    (map-set insurance-assessors tx-sender
+      {
+        reputation-score: u100,
+        total-claims-assessed: u0,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (purchase-policy (land-id uint) (coverage-amount uint) (annual-premium uint) (duration-blocks uint))
+  (let ((new-policy-id (+ (var-get policy-id-counter) u1)))
+    (match (map-get? land-registry land-id)
+      land-data
+      (begin
+        (asserts! (is-eq tx-sender (get owner land-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-verified land-data) ERR_NOT_AUTHORIZED)
+        (asserts! (>= (stx-get-balance tx-sender) annual-premium) ERR_INSUFFICIENT_STAKE)
+        
+        (try! (stx-transfer? annual-premium tx-sender (as-contract tx-sender)))
+        (var-set insurance-pool (+ (var-get insurance-pool) annual-premium))
+        
+        (map-set insurance-policies new-policy-id
+          {
+            land-id: land-id,
+            policyholder: tx-sender,
+            coverage-amount: coverage-amount,
+            annual-premium: annual-premium,
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height duration-blocks),
+            last-premium-payment: stacks-block-height,
+            is-active: true
+          }
+        )
+        (var-set policy-id-counter new-policy-id)
+        (ok new-policy-id)
+      )
+      ERR_LAND_NOT_FOUND
+    )
+  )
+)
+
+(define-public (pay-premium (policy-id uint))
+  (match (map-get? insurance-policies policy-id)
+    policy-data
+    (begin
+      (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR_NOT_AUTHORIZED)
+      (asserts! (get is-active policy-data) ERR_POLICY_EXPIRED)
+      (asserts! (< stacks-block-height (get end-block policy-data)) ERR_POLICY_EXPIRED)
+      (asserts! (>= (stx-get-balance tx-sender) (get annual-premium policy-data)) ERR_INSUFFICIENT_STAKE)
+      
+      (try! (stx-transfer? (get annual-premium policy-data) tx-sender (as-contract tx-sender)))
+      (var-set insurance-pool (+ (var-get insurance-pool) (get annual-premium policy-data)))
+      
+      (map-set insurance-policies policy-id
+        (merge policy-data {last-premium-payment: stacks-block-height})
+      )
+      (ok true)
+    )
+    ERR_POLICY_NOT_FOUND
+  )
+)
+
+(define-public (file-claim (policy-id uint) (damage-description (string-ascii 500)) (claim-amount uint))
+  (let ((new-claim-id (+ (var-get claim-id-counter) u1)))
+    (match (map-get? insurance-policies policy-id)
+      policy-data
+      (begin
+        (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active policy-data) ERR_POLICY_EXPIRED)
+        (asserts! (< stacks-block-height (get end-block policy-data)) ERR_POLICY_EXPIRED)
+        (asserts! (<= claim-amount (get coverage-amount policy-data)) ERR_INSUFFICIENT_COVERAGE)
+        
+        (map-set insurance-claims new-claim-id
+          {
+            policy-id: policy-id,
+            claimant: tx-sender,
+            damage-description: damage-description,
+            claim-amount: claim-amount,
+            assessor: none,
+            status: "pending",
+            filed-at: stacks-block-height,
+            processed-at: none
+          }
+        )
+        (var-set claim-id-counter new-claim-id)
+        (ok new-claim-id)
+      )
+      ERR_POLICY_NOT_FOUND
+    )
+  )
+)
+
+(define-public (assess-claim (claim-id uint) (approved bool))
+  (match (map-get? insurance-assessors tx-sender)
+    assessor-data
+    (match (map-get? insurance-claims claim-id)
+      claim-data
+      (begin
+        (asserts! (get is-active assessor-data) ERR_NOT_AUTHORIZED)
+        (asserts! (is-eq (get status claim-data) "pending") ERR_CLAIM_ALREADY_PROCESSED)
+        
+        (if approved
+          (begin
+            (asserts! (>= (var-get insurance-pool) (get claim-amount claim-data)) ERR_INSUFFICIENT_COVERAGE)
+            (try! (as-contract (stx-transfer? (get claim-amount claim-data) tx-sender (get claimant claim-data))))
+            (var-set insurance-pool (- (var-get insurance-pool) (get claim-amount claim-data)))
+            (map-set insurance-claims claim-id
+              (merge claim-data 
+                {
+                  assessor: (some tx-sender),
+                  status: "approved",
+                  processed-at: (some stacks-block-height)
+                }
+              )
+            )
+          )
+          (map-set insurance-claims claim-id
+            (merge claim-data 
+              {
+                assessor: (some tx-sender),
+                status: "rejected",
+                processed-at: (some stacks-block-height)
+              }
+            )
+          )
+        )
+        
+        (map-set insurance-assessors tx-sender
+          (merge assessor-data 
+            {
+              total-claims-assessed: (+ (get total-claims-assessed assessor-data) u1)
+            }
+          )
+        )
+        (ok true)
+      )
+      ERR_CLAIM_NOT_FOUND
+    )
+    ERR_NOT_AUTHORIZED
+  )
+)
+
+(define-public (cancel-policy (policy-id uint))
+  (match (map-get? insurance-policies policy-id)
+    policy-data
+    (begin
+      (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR_NOT_AUTHORIZED)
+      (map-set insurance-policies policy-id (merge policy-data {is-active: false}))
+      (ok true)
+    )
+    ERR_POLICY_NOT_FOUND
+  )
+)
+
+(define-read-only (get-policy-info (policy-id uint))
+  (map-get? insurance-policies policy-id)
+)
+
+(define-read-only (get-claim-info (claim-id uint))
+  (map-get? insurance-claims claim-id)
+)
+
+(define-read-only (get-assessor-info (assessor principal))
+  (map-get? insurance-assessors assessor)
+)
+
+(define-read-only (get-insurance-pool-balance)
+  (var-get insurance-pool)
+)
+
+(define-read-only (is-premium-overdue (policy-id uint) (blocks-per-year uint))
+  (match (map-get? insurance-policies policy-id)
+    policy-data
+    (if (get is-active policy-data)
+      (> (- stacks-block-height (get last-premium-payment policy-data)) blocks-per-year)
+      false
+    )
+    false
+  )
+)
+
+(define-read-only (get-policy-count)
+  (var-get policy-id-counter)
+)
+
+(define-read-only (get-claim-count)
+  (var-get claim-id-counter)
+)
