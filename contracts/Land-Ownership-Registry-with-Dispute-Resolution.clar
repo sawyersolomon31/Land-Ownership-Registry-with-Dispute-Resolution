@@ -879,3 +879,339 @@
 (define-read-only (get-claim-count)
   (var-get claim-id-counter)
 )
+
+;; Land Valuation System - Independent Feature
+(define-constant ERR_APPRAISER_NOT_FOUND (err u123))
+(define-constant ERR_VALUATION_NOT_FOUND (err u124))
+(define-constant ERR_APPRAISER_NOT_CERTIFIED (err u125))
+(define-constant ERR_INVALID_VALUATION_AMOUNT (err u126))
+(define-constant ERR_CERTIFICATION_EXPIRED (err u127))
+(define-constant ERR_ALREADY_CERTIFIED (err u128))
+
+(define-data-var valuation-id-counter uint u0)
+(define-data-var certification-fee uint u500)
+(define-data-var valuation-fee uint u100)
+
+;; Map to store certified appraisers
+(define-map certified-appraisers
+  principal
+  {
+    certification-date: uint,
+    expiry-date: uint,
+    total-valuations: uint,
+    reputation-score: uint,
+    license-number: (string-ascii 50),
+    is-active: bool
+  }
+)
+
+;; Map to store land valuations
+(define-map land-valuations
+  uint
+  {
+    land-id: uint,
+    appraiser: principal,
+    valuation-amount: uint,
+    valuation-date: uint,
+    valuation-method: (string-ascii 100),
+    market-conditions: (string-ascii 200),
+    comparable-properties: (string-ascii 300),
+    validity-period-blocks: uint,
+    is-disputed: bool,
+    confidence-level: uint
+  }
+)
+
+;; Map to track valuation history per land parcel
+(define-map land-valuation-history
+  uint
+  (list 20 uint)
+)
+
+;; Map to store valuation disputes
+(define-map valuation-disputes
+  uint
+  {
+    valuation-id: uint,
+    disputing-party: principal,
+    dispute-reason: (string-ascii 500),
+    filed-at: uint,
+    status: (string-ascii 20),
+    resolution: (optional (string-ascii 300))
+  }
+)
+
+;; Public function to register as a certified appraiser
+(define-public (register-appraiser (license-number (string-ascii 50)) (certification-period-blocks uint))
+  (begin
+    (asserts! (is-none (map-get? certified-appraisers tx-sender)) ERR_ALREADY_CERTIFIED)
+    (asserts! (>= (stx-get-balance tx-sender) (var-get certification-fee)) ERR_INSUFFICIENT_STAKE)
+    
+    ;; Transfer certification fee to contract
+    (try! (stx-transfer? (var-get certification-fee) tx-sender (as-contract tx-sender)))
+    
+    (map-set certified-appraisers tx-sender
+      {
+        certification-date: stacks-block-height,
+        expiry-date: (+ stacks-block-height certification-period-blocks),
+        total-valuations: u0,
+        reputation-score: u100,
+        license-number: license-number,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Public function to renew appraiser certification
+(define-public (renew-certification (additional-period-blocks uint))
+  (match (map-get? certified-appraisers tx-sender)
+    appraiser-data
+    (begin
+      (asserts! (>= (stx-get-balance tx-sender) (var-get certification-fee)) ERR_INSUFFICIENT_STAKE)
+      
+      ;; Transfer renewal fee to contract
+      (try! (stx-transfer? (var-get certification-fee) tx-sender (as-contract tx-sender)))
+      
+      (map-set certified-appraisers tx-sender
+        (merge appraiser-data 
+          {
+            expiry-date: (+ (get expiry-date appraiser-data) additional-period-blocks),
+            is-active: true
+          }
+        )
+      )
+      (ok true)
+    )
+    ERR_APPRAISER_NOT_FOUND
+  )
+)
+
+;; Public function to submit a land valuation
+(define-public (submit-valuation 
+  (land-id uint) 
+  (valuation-amount uint) 
+  (valuation-method (string-ascii 100))
+  (market-conditions (string-ascii 200))
+  (comparable-properties (string-ascii 300))
+  (validity-period-blocks uint)
+  (confidence-level uint)
+)
+  (let ((new-valuation-id (+ (var-get valuation-id-counter) u1))
+        (current-history (default-to (list) (map-get? land-valuation-history land-id))))
+    (match (map-get? certified-appraisers tx-sender)
+      appraiser-data
+      (match (map-get? land-registry land-id)
+        land-data
+        (begin
+          ;; Validate appraiser is active and certified
+          (asserts! (get is-active appraiser-data) ERR_APPRAISER_NOT_CERTIFIED)
+          (asserts! (< stacks-block-height (get expiry-date appraiser-data)) ERR_CERTIFICATION_EXPIRED)
+          
+          ;; Validate valuation parameters
+          (asserts! (> valuation-amount u0) ERR_INVALID_VALUATION_AMOUNT)
+          (asserts! (<= confidence-level u100) ERR_INVALID_VALUATION_AMOUNT)
+          (asserts! (>= (stx-get-balance tx-sender) (var-get valuation-fee)) ERR_INSUFFICIENT_STAKE)
+          
+          ;; Transfer valuation fee
+          (try! (stx-transfer? (var-get valuation-fee) tx-sender (as-contract tx-sender)))
+          
+          ;; Store the valuation
+          (map-set land-valuations new-valuation-id
+            {
+              land-id: land-id,
+              appraiser: tx-sender,
+              valuation-amount: valuation-amount,
+              valuation-date: stacks-block-height,
+              valuation-method: valuation-method,
+              market-conditions: market-conditions,
+              comparable-properties: comparable-properties,
+              validity-period-blocks: validity-period-blocks,
+              is-disputed: false,
+              confidence-level: confidence-level
+            }
+          )
+          
+          ;; Update valuation history for the land
+          (map-set land-valuation-history land-id 
+            (unwrap-panic (as-max-len? (append current-history new-valuation-id) u20))
+          )
+          
+          ;; Update appraiser's statistics
+          (map-set certified-appraisers tx-sender
+            (merge appraiser-data 
+              {
+                total-valuations: (+ (get total-valuations appraiser-data) u1)
+              }
+            )
+          )
+          
+          (var-set valuation-id-counter new-valuation-id)
+          (ok new-valuation-id)
+        )
+        ERR_LAND_NOT_FOUND
+      )
+      ERR_APPRAISER_NOT_FOUND
+    )
+  )
+)
+
+;; Public function to dispute a valuation
+(define-public (dispute-valuation (valuation-id uint) (dispute-reason (string-ascii 500)))
+  (match (map-get? land-valuations valuation-id)
+    valuation-data
+    (match (map-get? land-registry (get land-id valuation-data))
+      land-data
+      (begin
+        ;; Only land owner can dispute valuations
+        (asserts! (is-eq tx-sender (get owner land-data)) ERR_NOT_AUTHORIZED)
+        
+        ;; Mark valuation as disputed
+        (map-set land-valuations valuation-id
+          (merge valuation-data {is-disputed: true})
+        )
+        
+        ;; Create dispute record
+        (map-set valuation-disputes valuation-id
+          {
+            valuation-id: valuation-id,
+            disputing-party: tx-sender,
+            dispute-reason: dispute-reason,
+            filed-at: stacks-block-height,
+            status: "pending",
+            resolution: none
+          }
+        )
+        (ok true)
+      )
+      ERR_LAND_NOT_FOUND
+    )
+    ERR_VALUATION_NOT_FOUND
+  )
+)
+
+;; Public function to resolve valuation dispute (contract owner only)
+(define-public (resolve-valuation-dispute (valuation-id uint) (resolution (string-ascii 300)) (uphold-valuation bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    
+    (match (map-get? valuation-disputes valuation-id)
+      dispute-data
+      (match (map-get? land-valuations valuation-id)
+        valuation-data
+        (match (map-get? certified-appraisers (get appraiser valuation-data))
+          appraiser-data
+          (begin
+            ;; Update dispute status
+            (map-set valuation-disputes valuation-id
+              (merge dispute-data 
+                {
+                  status: (if uphold-valuation "resolved-upheld" "resolved-overturned"),
+                  resolution: (some resolution)
+                }
+              )
+            )
+            
+            ;; Update valuation dispute status
+            (map-set land-valuations valuation-id
+              (merge valuation-data {is-disputed: false})
+            )
+            
+            ;; Adjust appraiser reputation based on outcome
+            (let ((reputation-change (if uphold-valuation u5 (- u0 u10))))
+              (map-set certified-appraisers (get appraiser valuation-data)
+                (merge appraiser-data 
+                  {
+                    reputation-score: (if uphold-valuation 
+                                        (+ (get reputation-score appraiser-data) u5)
+                                        (if (> (get reputation-score appraiser-data) u10)
+                                          (- (get reputation-score appraiser-data) u10)
+                                          u0
+                                        )
+                                      )
+                  }
+                )
+              )
+            )
+            (ok true)
+          )
+          ERR_APPRAISER_NOT_FOUND
+        )
+        ERR_VALUATION_NOT_FOUND
+      )
+      ERR_VALUATION_NOT_FOUND
+    )
+  )
+)
+
+;; Read-only functions
+(define-read-only (get-appraiser-info (appraiser principal))
+  (map-get? certified-appraisers appraiser)
+)
+
+(define-read-only (get-valuation-info (valuation-id uint))
+  (map-get? land-valuations valuation-id)
+)
+
+(define-read-only (get-land-valuation-history (land-id uint))
+  (map-get? land-valuation-history land-id)
+)
+
+(define-read-only (get-valuation-dispute (valuation-id uint))
+  (map-get? valuation-disputes valuation-id)
+)
+
+(define-read-only (get-latest-valuation (land-id uint))
+  (match (map-get? land-valuation-history land-id)
+    history-list
+    (match (element-at? history-list (- (len history-list) u1))
+      latest-valuation-id
+      (map-get? land-valuations latest-valuation-id)
+      none
+    )
+    none
+  )
+)
+
+(define-read-only (is-appraiser-certified (appraiser principal))
+  (match (map-get? certified-appraisers appraiser)
+    appraiser-data
+    (and (get is-active appraiser-data) (< stacks-block-height (get expiry-date appraiser-data)))
+    false
+  )
+)
+
+(define-read-only (get-average-valuation (land-id uint))
+  (match (map-get? land-valuation-history land-id)
+    history-list
+    (let ((total-valuations (len history-list)))
+      (if (> total-valuations u0)
+        (some (/ (fold calculate-valuation-sum history-list u0) total-valuations))
+        none
+      )
+    )
+    none
+  )
+)
+
+(define-read-only (get-valuation-count)
+  (var-get valuation-id-counter)
+)
+
+(define-read-only (get-certification-fee)
+  (var-get certification-fee)
+)
+
+(define-read-only (get-valuation-fee)
+  (var-get valuation-fee)
+)
+
+;; Helper function for calculating valuation sum
+(define-private (calculate-valuation-sum (valuation-id uint) (running-sum uint))
+  (match (map-get? land-valuations valuation-id)
+    valuation-data
+    (+ running-sum (get valuation-amount valuation-data))
+    running-sum
+  )
+)
