@@ -1215,3 +1215,213 @@
     running-sum
   )
 )
+
+;; Land Mortgage System - Independent Feature
+(define-constant ERR_MORTGAGE_NOT_FOUND (err u129))
+(define-constant ERR_MORTGAGE_ACTIVE (err u130))
+(define-constant ERR_MORTGAGE_DEFAULTED (err u131))
+(define-constant ERR_INVALID_LOAN_AMOUNT (err u132))
+(define-constant ERR_INSUFFICIENT_LOAN_BALANCE (err u133))
+(define-constant ERR_CANNOT_FORECLOSE_ON_TIME (err u134))
+(define-constant ERR_INVALID_INTEREST_RATE (err u135))
+
+(define-data-var mortgage-id-counter uint u0)
+(define-data-var default-interest-rate uint u5)
+(define-data-var default-loan-term-blocks uint u100000)
+
+(define-map land-mortgages
+  uint
+  {
+    land-id: uint,
+    borrower: principal,
+    lender: principal,
+    loan-amount: uint,
+    interest-rate: uint,
+    start-block: uint,
+    end-block: uint,
+    total-paid: uint,
+    remaining-balance: uint,
+    is-active: bool,
+    is-defaulted: bool
+  }
+)
+
+(define-map mortgage-payments
+  {mortgage-id: uint, payment-sequence: uint}
+  {
+    amount: uint,
+    timestamp: uint,
+    block-height: uint
+  }
+)
+
+(define-map mortgage-payment-counts
+  uint
+  uint
+)
+
+(define-public (create-mortgage (land-id uint) (lender principal) (loan-amount uint) (interest-rate uint) (loan-term-blocks uint))
+  (let ((new-mortgage-id (+ (var-get mortgage-id-counter) u1)))
+    (match (map-get? land-registry land-id)
+      land-data
+      (begin
+        (asserts! (is-eq tx-sender (get owner land-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-verified land-data) ERR_NOT_AUTHORIZED)
+        (asserts! (> loan-amount u0) ERR_INVALID_LOAN_AMOUNT)
+        (asserts! (<= interest-rate u100) ERR_INVALID_INTEREST_RATE)
+        (asserts! (>= (stx-get-balance lender) loan-amount) ERR_INSUFFICIENT_STAKE)
+        
+        (try! (stx-transfer? loan-amount lender tx-sender))
+        
+        (map-set land-mortgages new-mortgage-id
+          {
+            land-id: land-id,
+            borrower: tx-sender,
+            lender: lender,
+            loan-amount: loan-amount,
+            interest-rate: interest-rate,
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height loan-term-blocks),
+            total-paid: u0,
+            remaining-balance: loan-amount,
+            is-active: true,
+            is-defaulted: false
+          }
+        )
+        (map-set mortgage-payment-counts new-mortgage-id u0)
+        (var-set mortgage-id-counter new-mortgage-id)
+        (ok new-mortgage-id)
+      )
+      ERR_LAND_NOT_FOUND
+    )
+  )
+)
+
+(define-public (make-mortgage-payment (mortgage-id uint) (payment-amount uint))
+  (match (map-get? land-mortgages mortgage-id)
+    mortgage-data
+    (begin
+      (asserts! (is-eq tx-sender (get borrower mortgage-data)) ERR_NOT_AUTHORIZED)
+      (asserts! (get is-active mortgage-data) ERR_MORTGAGE_ACTIVE)
+      (asserts! (not (get is-defaulted mortgage-data)) ERR_MORTGAGE_DEFAULTED)
+      (asserts! (<= payment-amount (get remaining-balance mortgage-data)) ERR_INSUFFICIENT_LOAN_BALANCE)
+      (asserts! (>= (stx-get-balance tx-sender) payment-amount) ERR_INSUFFICIENT_STAKE)
+      
+      (try! (stx-transfer? payment-amount tx-sender (get lender mortgage-data)))
+      
+      (let ((new-balance (- (get remaining-balance mortgage-data) payment-amount))
+            (payment-count (default-to u0 (map-get? mortgage-payment-counts mortgage-id)))
+            (new-payment-sequence (+ payment-count u1)))
+        
+        (map-set mortgage-payments {mortgage-id: mortgage-id, payment-sequence: new-payment-sequence}
+          {
+            amount: payment-amount,
+            timestamp: stacks-block-height,
+            block-height: stacks-block-height
+          }
+        )
+        
+        (map-set land-mortgages mortgage-id
+          (merge mortgage-data
+            {
+              total-paid: (+ (get total-paid mortgage-data) payment-amount),
+              remaining-balance: new-balance
+            }
+          )
+        )
+        
+        (map-set mortgage-payment-counts mortgage-id new-payment-sequence)
+        
+        (if (is-eq new-balance u0)
+          (map-set land-mortgages mortgage-id (merge mortgage-data {is-active: false}))
+          true
+        )
+        (ok new-balance)
+      )
+    )
+    ERR_MORTGAGE_NOT_FOUND
+  )
+)
+
+(define-public (foreclose-mortgage (mortgage-id uint))
+  (match (map-get? land-mortgages mortgage-id)
+    mortgage-data
+    (begin
+      (asserts! (is-eq tx-sender (get lender mortgage-data)) ERR_NOT_AUTHORIZED)
+      (asserts! (get is-active mortgage-data) ERR_MORTGAGE_ACTIVE)
+      (asserts! (>= stacks-block-height (get end-block mortgage-data)) ERR_CANNOT_FORECLOSE_ON_TIME)
+      (asserts! (> (get remaining-balance mortgage-data) u0) ERR_INSUFFICIENT_LOAN_BALANCE)
+      
+      (match (map-get? land-registry (get land-id mortgage-data))
+        land-data
+        (begin
+          (map-set land-registry (get land-id mortgage-data)
+            (merge land-data {owner: (get lender mortgage-data)})
+          )
+          
+          (map-set land-mortgages mortgage-id
+            (merge mortgage-data
+              {
+                is-active: false,
+                is-defaulted: true
+              }
+            )
+          )
+          (ok true)
+        )
+        ERR_LAND_NOT_FOUND
+      )
+    )
+    ERR_MORTGAGE_NOT_FOUND
+  )
+)
+
+(define-public (repay-mortgage-early (mortgage-id uint))
+  (match (map-get? land-mortgages mortgage-id)
+    mortgage-data
+    (let ((full-balance (get remaining-balance mortgage-data)))
+      (begin
+        (asserts! (is-eq tx-sender (get borrower mortgage-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active mortgage-data) ERR_MORTGAGE_ACTIVE)
+        (asserts! (not (get is-defaulted mortgage-data)) ERR_MORTGAGE_DEFAULTED)
+        (asserts! (>= (stx-get-balance tx-sender) full-balance) ERR_INSUFFICIENT_STAKE)
+        (try! (stx-transfer? full-balance tx-sender (get lender mortgage-data)))
+        (map-set land-mortgages mortgage-id
+          (merge mortgage-data
+            {
+              total-paid: (+ (get total-paid mortgage-data) full-balance),
+              remaining-balance: u0,
+              is-active: false
+            }
+          )
+        )
+        (ok u0)
+      )
+    )
+    ERR_MORTGAGE_NOT_FOUND
+  )
+)
+
+(define-read-only (get-mortgage-info (mortgage-id uint))
+  (map-get? land-mortgages mortgage-id)
+)
+
+(define-read-only (get-mortgage-payment (mortgage-id uint) (payment-sequence uint))
+  (map-get? mortgage-payments {mortgage-id: mortgage-id, payment-sequence: payment-sequence})
+)
+
+(define-read-only (get-mortgage-payment-count (mortgage-id uint))
+  (default-to u0 (map-get? mortgage-payment-counts mortgage-id))
+)
+
+(define-read-only (get-mortgage-count)
+  (var-get mortgage-id-counter)
+)
+
+(define-read-only (get-default-interest-rate)
+  (var-get default-interest-rate)
+)
+
+(define-read-only (get-default-loan-term)
+  (var-get default-loan-term-blocks)
+)
